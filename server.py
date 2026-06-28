@@ -6,13 +6,18 @@ import requests
 app = Flask(__name__)
 
 def detect_html(url):
-    r = requests.get(url, timeout=10)
-    urls = re.findall(r'https?://[^\s"\'<>]+', r.text)
+    try:
+        r = requests.get(url, timeout=10)
+        urls = re.findall(r'https?://[^\s"\'<>]+', r.text)
 
-    for u in urls:
-        if ".m3u8" in u:
-            return u
-    return None
+        for u in urls:
+            if ".m3u8" in u:
+                return u
+
+        return None
+
+    except:
+        return None
 
 
 def detect_playwright(url):
