@@ -18,22 +18,30 @@ def detect_html(url):
 def detect_playwright(url):
     found = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
+            page = browser.new_page()
 
-        def on_response(resp):
-            if ".m3u8" in resp.url:
-                found.append(resp.url)
+            def on_response(resp):
+                try:
+                    if ".m3u8" in resp.url:
+                        found.append(resp.url)
+                except:
+                    pass
 
-        page.on("response", on_response)
-        page.goto(url, timeout=20000)
-        page.wait_for_timeout(5000)
+            page.on("response", on_response)
+            page.goto(url, timeout=20000)
+            page.wait_for_timeout(5000)
 
-        browser.close()
+            browser.close()
+    except Exception:
+        return []
 
     return found
-
 
 @app.route("/find")
 def find():
@@ -48,9 +56,6 @@ def find():
         return jsonify({"stream": streams[0]})
 
     return jsonify({"stream": None})
-
-
-app.run(host="0.0.0.0", port=5000)
 
 import os
 
