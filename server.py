@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, Response, send_from_directory
 import requests
 import re
 import os
@@ -10,46 +10,49 @@ import time
 app = Flask(__name__)
 
 # =========================
-# CACHE
+# STORAGE (DYNAMIC CHANNELS)
 # =========================
+CHANNELS = {}  # name -> source url
+STREAMS = {}   # stream_id -> ffmpeg process info
 CACHE = {}
-CACHE_TTL = 60
-
-STREAM_EXTENSIONS = (
-    ".m3u8", ".mpd", ".ts", ".mp4", ".mkv", ".m4s", ".webm"
-)
-
-KEYWORDS = (
-    "manifest", "playlist", "master", "dash", "hls", "live", "index"
-)
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
 
 OUTPUT_DIR = "streams"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-
-# =========================
-# CACHE
-# =========================
-def cache_get(url):
-    if url in CACHE:
-        val, t = CACHE[url]
-        if time.time() - t < CACHE_TTL:
-            return val
-    return None
-
-
-def cache_set(url, val):
-    CACHE[url] = (val, time.time())
+CHECK_INTERVAL = 15
 
 
 # =========================
-# BASIC SCRAPER
+# HEADERS
 # =========================
-def detect_stream(url):
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+STREAM_HINTS = (".m3u8", ".mpd", ".mp4", ".ts", ".m4s", ".mkv")
+KEYWORDS = ("manifest", "playlist", "dash", "hls", "live")
+
+
+# =========================
+# ADD CHANNEL API (DYNAMIC)
+# =========================
+@app.route("/add")
+def add_channel():
+    name = request.args.get("name")
+    url = request.args.get("url")
+
+    if not name or not url:
+        return jsonify({"error": "missing name or url"}), 400
+
+    CHANNELS[name] = url
+
+    return jsonify({"ok": True, "channels": len(CHANNELS)})
+
+
+# =========================
+# SIMPLE STREAM FINDER
+# =========================
+def find_stream(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         html = r.text
@@ -58,7 +61,7 @@ def detect_stream(url):
 
         for u in urls:
             t = u.lower()
-            if any(x in t for x in STREAM_EXTENSIONS) or any(k in t for k in KEYWORDS):
+            if any(x in t for x in STREAM_HINTS) or any(k in t for k in KEYWORDS):
                 return u
 
     except:
@@ -68,94 +71,129 @@ def detect_stream(url):
 
 
 # =========================
-# RESOLVER + CACHE
+# RESOLVE WITH RETRY
 # =========================
 def resolve(url):
-    cached = cache_get(url)
-    if cached:
-        return cached
+    if url in CACHE:
+        return CACHE[url]
 
-    stream = detect_stream(url)
-
-    if stream:
-        cache_set(url, stream)
-        return stream
+    for _ in range(3):
+        stream = find_stream(url)
+        if stream:
+            CACHE[url] = stream
+            return stream
+        time.sleep(0.5)
 
     return None
 
 
 # =========================
-# 🔥 FFMPEG FIXED WORKER (IMPORTANT)
+# FFMPEG PROXY (HLS OUTPUT)
 # =========================
-def ffmpeg_worker(stream_id, input_url):
+def ffmpeg_worker(stream_id, url):
+    out_dir = os.path.join(OUTPUT_DIR, stream_id)
+    os.makedirs(out_dir, exist_ok=True)
 
-    path = os.path.join(OUTPUT_DIR, stream_id)
-    os.makedirs(path, exist_ok=True)
-
-    output = os.path.join(path, "index.m3u8")
+    output = os.path.join(out_dir, "index.m3u8")
 
     cmd = [
         "ffmpeg",
         "-re",
-        "-i", input_url,
+        "-i", url,
 
-        # 🔥 KLÍČOVÉ: musí se re-encode (COPY nefunguje u MPD)
+        # stabilní TV output
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
 
         "-c:a", "aac",
-        "-b:a", "128k",
 
         "-f", "hls",
         "-hls_time", "4",
         "-hls_list_size", "6",
-        "-hls_flags", "delete_segments+append_list+independent_segments",
+        "-hls_flags", "delete_segments+append_list",
 
         output
     ]
 
-    # 🔥 důležité: permanentní proces
-    subprocess.Popen(cmd)
+    proc = subprocess.Popen(cmd)
+
+    STREAMS[stream_id] = {
+        "proc": proc,
+        "url": url,
+        "last_ok": time.time()
+    }
 
 
 # =========================
-# API
+# AUTO HEAL WATCHDOG (⚡ KEY FEATURE)
 # =========================
-@app.route("/find")
-def find():
+def watchdog():
+    while True:
+        time.sleep(CHECK_INTERVAL)
 
-    url = request.args.get("url")
+        for sid in list(STREAMS.keys()):
+            info = STREAMS[sid]
+            proc = info["proc"]
 
-    if not url:
-        return jsonify({"error": "missing url"}), 400
+            # restart když FFmpeg spadne
+            if proc.poll() is not None:
+                print("RESTART STREAM:", sid)
 
-    stream = resolve(url)
+                new_id = sid
+                ffmpeg_worker(new_id, info["url"])
+
+                del STREAMS[sid]
+
+
+threading.Thread(target=watchdog, daemon=True).start()
+
+
+# =========================
+# PLAY CHANNEL
+# =========================
+@app.route("/play/<name>")
+def play(name):
+
+    if name not in CHANNELS:
+        return "not found", 404
+
+    source = CHANNELS[name]
+
+    stream = resolve(source)
 
     if not stream:
-        return jsonify({"stream": None})
+        return "no stream found", 404
 
-    # ✔ pokud už je m3u8 → direct
-    if ".m3u8" in stream:
-        return jsonify({"stream": stream, "type": "direct"})
+    sid = str(uuid.uuid4())
 
-    # 🔥 jinak FFmpeg proxy
-    stream_id = str(uuid.uuid4())
-
-    t = threading.Thread(
+    threading.Thread(
         target=ffmpeg_worker,
-        args=(stream_id, stream)
-    )
-    t.start()
+        args=(sid, stream)
+    ).start()
 
     return jsonify({
-        "stream": f"/hls/{stream_id}/index.m3u8",
-        "type": "ffmpeg"
+        "url": f"/hls/{sid}/index.m3u8"
     })
 
 
 # =========================
-# SERVE HLS FILES
+# M3U PLAYLIST (FOR IPTV APPS)
+# =========================
+@app.route("/playlist.m3u")
+def playlist():
+    base = request.host_url.rstrip("/")
+    out = "#EXTM3U\n"
+
+    for name in CHANNELS:
+        out += f"#EXTINF:-1,{name}\n"
+        out += f"{base}/play/{name}\n"
+
+    return Response(out, mimetype="text/plain")
+
+
+# =========================
+# SERVE HLS
 # =========================
 @app.route("/hls/<sid>/<file>")
 def hls(sid, file):
@@ -165,7 +203,7 @@ def hls(sid, file):
 # =========================
 @app.route("/")
 def home():
-    return "FFmpeg IPTV Proxy FIX running"
+    return "DYNAMIC IPTV SERVER + AUTO HEAL RUNNING"
 
 
 # =========================
