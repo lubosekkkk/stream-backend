@@ -9,22 +9,21 @@ app = Flask(__name__)
 # CONFIG
 # =========================
 CACHE = {}
-CACHE_TTL = 90  # lehce delší cache = méně failů
+CACHE_TTL = 90
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Accept": "*/*",
-    "Connection": "keep-alive"
+    "Accept": "*/*"
 }
 
-STREAM_EXT = (".m3u8", ".mpd", ".ts", ".m4s", ".mp4")
-KEYWORDS = ("manifest", "playlist", "master", "hls", "dash", "live", "chunklist", "index")
+STREAM_EXT = (".m3u8", ".mpd", ".ts", ".m4s", ".mp4", ".mkv")
+KEYWORDS = ("manifest", "playlist", "master", "hls", "dash", "live", "index")
 
 TIMEOUT = 8
 
 
 # =========================
-# CHANNELS (3 SOURCES EACH)
+# CHANNELS
 # =========================
 CHANNELS = {
     "test": [
@@ -55,24 +54,24 @@ def cache_set(url, stream):
 
 
 # =========================
-# STREAM DETECTOR (IMPROVED)
+# STREAM DETECTOR
 # =========================
 def detect_stream(url):
     try:
-        time.sleep(0.2)  # 🔥 jemný delay = méně bloků
+        time.sleep(0.2)
 
         r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         html = r.text
 
-        # 1) direct URL scan (lepší regex)
+        # direct links
         links = re.findall(r'https?://[^\s"\'<>]+', html)
 
         for l in links:
             low = l.lower()
-            if any(ext in low for ext in STREAM_EXT):
+            if any(x in low for x in STREAM_EXT):
                 return l
 
-        # 2) m3u8/mpd inline detection (silnější)
+        # m3u8 / mpd direct
         m3u8 = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
         if m3u8:
             return m3u8[0]
@@ -81,13 +80,11 @@ def detect_stream(url):
         if mpd:
             return mpd[0]
 
-        # 3) iframe fallback (hlubší scan)
+        # iframe fallback
         iframes = re.findall(r'src="(http[^"]+)"', html)
 
         for i in iframes:
             try:
-                time.sleep(0.2)
-
                 r2 = requests.get(i, headers=HEADERS, timeout=TIMEOUT)
                 h2 = r2.text
 
@@ -100,24 +97,22 @@ def detect_stream(url):
                     return mp[0]
 
             except:
-                continue
+                pass
 
     except:
-        pass
+        return None
 
     return None
 
 
 # =========================
-# SLOW + SMART RESOLVER
+# RESOLVER
 # =========================
-def resolve_sources(sources, retries=6, delay=2):
-
-    for attempt in range(retries):
+def resolve_sources(sources, retries=5, delay=2):
+    for i in range(retries):
 
         for url in sources:
 
-            # cache first
             cached = cache_get(url)
             if cached:
                 return cached
@@ -128,39 +123,28 @@ def resolve_sources(sources, retries=6, delay=2):
                 cache_set(url, stream)
                 return stream
 
-        # 🔥 postupné zpomalování (lepší než fixní delay)
-        time.sleep(delay + attempt * 0.5)
+        time.sleep(delay + i * 0.5)
 
     return None
 
 
 # =========================
-# PLAY ENDPOINT (VLC FRIENDLY)
+# API
 # =========================
 @app.route("/play/<name>")
 def play(name):
 
     if name not in CHANNELS:
-        return "not found", 404
+        return jsonify({"error": "not found"}), 404
 
-    sources = CHANNELS[name]
-
-    stream = resolve_sources(sources)
+    stream = resolve_sources(CHANNELS[name])
 
     if not stream:
-        return jsonify({
-            "error": "stream not found",
-            "hint": "all sources failed"
-        }), 404
+        return jsonify({"error": "stream not found"}), 404
 
-    return jsonify({
-        "stream": stream
-    })
+    return jsonify({"stream": stream})
 
 
-# =========================
-# M3U PLAYLIST (VLC)
-# =========================
 @app.route("/playlist.m3u")
 def playlist():
     base = request.host_url.rstrip("/")
@@ -173,7 +157,6 @@ def playlist():
     return Response(out, mimetype="text/plain")
 
 
-# =========================
 @app.route("/")
 def home():
-    return "MAX STABLE STREAM RESOLVER RUNNING"
+    return "STREAM SERVER RUNNING"
