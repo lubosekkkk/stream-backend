@@ -1,153 +1,160 @@
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, jsonify
+from playwright.sync_api import sync_playwright
 import requests
 import re
-import time
+import os
 
 app = Flask(__name__)
 
 # =========================
-# CONFIG
+# Stream přípony
 # =========================
-CACHE = {}
-CACHE_TTL = 60  # cache 60s
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
-
-STREAM_EXT = (".m3u8", ".mpd")
-KEYWORDS = ("manifest", "playlist", "master", "hls", "dash", "live")
-
-# =========================
-# CHANNELS (3 SOURCES EACH)
-# =========================
-CHANNELS = {
-    "test": [
-        "https://example.com/source1",
-        "https://example.com/source2",
-        "https://example.com/source3"
-    ]
-}
-
+STREAM_EXTENSIONS = (
+    ".m3u8",
+    ".mpd",
+    ".ts",
+    ".m4s",
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".f4m",
+    ".ism",
+    ".isml"
+)
 
 # =========================
-# CACHE
+# Klíčová slova
 # =========================
-def cache_get(url):
-    if url in CACHE:
-        stream, ts = CACHE[url]
-        if time.time() - ts < CACHE_TTL:
-            return stream
-    return None
-
-
-def cache_set(url, stream):
-    CACHE[url] = (stream, time.time())
+STREAM_KEYWORDS = (
+    "manifest",
+    "playlist",
+    "master",
+    "index.mpd",
+    "index.m3u8",
+    "live",
+    "dash",
+    "hls"
+)
 
 
 # =========================
-# STREAM DETECTOR (LIGHT SNIFFER V2)
+# HTML SCRAPER
 # =========================
-def detect_stream(url):
+def detect_html(url):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        html = r.text
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
 
-        # 1) direct links
-        links = re.findall(r'https?://[^\s"\'<>]+', html)
+        r = requests.get(url, headers=headers, timeout=10)
 
-        for l in links:
-            low = l.lower()
-            if any(ext in low for ext in STREAM_EXT):
-                return l
+        urls = re.findall(r'https?://[^\s"\'<>]+', r.text)
 
-        # 2) iframe follow (1 level)
-        iframes = re.findall(r'src="(http[^"]+)"', html)
+        for u in urls:
+            test = u.lower()
 
-        for i in iframes:
-            try:
-                r2 = requests.get(i, headers=HEADERS, timeout=10)
-                h2 = r2.text
+            if (
+                any(ext in test for ext in STREAM_EXTENSIONS)
+                or any(word in test for word in STREAM_KEYWORDS)
+            ):
+                return u
 
-                match = re.findall(r'https?://[^\s"\'<>]+\.m3u8', h2)
-                if match:
-                    return match[0]
+        return None
 
-                match2 = re.findall(r'https?://[^\s"\'<>]+\.mpd', h2)
-                if match2:
-                    return match2[0]
-
-            except:
-                pass
-
-    except:
-        pass
-
-    return None
+    except Exception:
+        return None
 
 
 # =========================
-# SLOW RESOLVER (retry + delay)
+# PLAYWRIGHT
 # =========================
-def resolve_sources(sources, retries=4, delay=2):
+def detect_playwright(url):
 
-    for _ in range(retries):
+    found = []
 
-        for url in sources:
+    try:
 
-            cached = cache_get(url)
-            if cached:
-                return cached
+        with sync_playwright() as p:
 
-            stream = detect_stream(url)
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox"
+                ]
+            )
 
-            if stream:
-                cache_set(url, stream)
-                return stream
+            page = browser.new_page()
 
-        time.sleep(delay)
+            def on_response(resp):
 
-    return None
+                test = resp.url.lower()
+
+                if (
+                    any(ext in test for ext in STREAM_EXTENSIONS)
+                    or any(word in test for word in STREAM_KEYWORDS)
+                ):
+                    if resp.url not in found:
+                        found.append(resp.url)
+
+            page.on("response", on_response)
+
+            page.goto(
+                url,
+                wait_until="networkidle",
+                timeout=30000
+            )
+
+            page.wait_for_timeout(5000)
+
+            browser.close()
+
+    except Exception:
+        return []
+
+    return found
 
 
 # =========================
-# PLAY ENDPOINT (VLC FRIENDLY)
+# API
 # =========================
-@app.route("/play/<name>")
-def play(name):
+@app.route("/find")
+def find():
 
-    if name not in CHANNELS:
-        return "not found", 404
+    url = request.args.get("url")
 
-    sources = CHANNELS[name]
+    if not url:
+        return jsonify({"error": "missing url"}), 400
 
-    stream = resolve_sources(sources)
+    stream = detect_html(url)
 
-    if not stream:
-        return jsonify({"error": "stream not found"}), 404
+    if stream:
+        return jsonify({
+            "stream": stream,
+            "source": "html"
+        })
 
-    # VLC dostane rovnou stream URL
+    streams = detect_playwright(url)
+
+    if streams:
+        return jsonify({
+            "stream": streams[0],
+            "source": "playwright"
+        })
+
     return jsonify({
-        "stream": stream
+        "stream": None
     })
 
 
 # =========================
-# M3U PLAYLIST (for VLC)
+# START
 # =========================
-@app.route("/playlist.m3u")
-def playlist():
-    base = request.host_url.rstrip("/")
-    out = "#EXTM3U\n"
+if __name__ == "__main__":
 
-    for name in CHANNELS:
-        out += f"#EXTINF:-1,{name}\n"
-        out += f"{base}/play/{name}\n"
+    port = int(os.environ.get("PORT", 5000))
 
-    return Response(out, mimetype="text/plain")
-
-
-# =========================
-@app.route("/")
-def home():
-    return "REAL STREAM SNIFFER V2 (NO FFMPEG) RUNNING"
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
