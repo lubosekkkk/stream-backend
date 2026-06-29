@@ -7,7 +7,7 @@ import os
 app = Flask(__name__)
 
 # =========================
-# Stream přípony
+# STREAM PATTERNS
 # =========================
 STREAM_EXTENSIONS = (
     ".m3u8",
@@ -22,9 +22,6 @@ STREAM_EXTENSIONS = (
     ".isml"
 )
 
-# =========================
-# Klíčová slova
-# =========================
 STREAM_KEYWORDS = (
     "manifest",
     "playlist",
@@ -33,7 +30,9 @@ STREAM_KEYWORDS = (
     "index.m3u8",
     "live",
     "dash",
-    "hls"
+    "hls",
+    "chunk",
+    "segment"
 )
 
 
@@ -42,13 +41,10 @@ STREAM_KEYWORDS = (
 # =========================
 def detect_html(url):
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        html = r.text
 
-        r = requests.get(url, headers=headers, timeout=10)
-
-        urls = re.findall(r'https?://[^\s"\'<>]+', r.text)
+        urls = re.findall(r'https?://[^\s"\'<>]+', html)
 
         for u in urls:
             test = u.lower()
@@ -61,51 +57,121 @@ def detect_html(url):
 
         return None
 
-    except Exception:
+    except:
         return None
 
 
 # =========================
-# PLAYWRIGHT
+# PLAYWRIGHT SCRAPER (HEAVY MODE)
 # =========================
 def detect_playwright(url):
-
     found = []
 
     try:
-
         with sync_playwright() as p:
-
             browser = p.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox"
-                ]
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
             )
 
             page = browser.new_page()
 
-            def on_response(resp):
+            # -------------------------
+            # REQUEST INTERCEPT (XHR + fetch)
+            # -------------------------
+            def on_request(req):
+                u = req.url.lower()
 
-                test = resp.url.lower()
+                if (
+                    any(ext in u for ext in STREAM_EXTENSIONS)
+                    or any(word in u for word in STREAM_KEYWORDS)
+                ):
+                    if req.url not in found:
+                        found.append(req.url)
+
+            # -------------------------
+            # RESPONSE INTERCEPT
+            # -------------------------
+            def on_response(resp):
+                u = resp.url.lower()
+
+                if (
+                    any(ext in u for ext in STREAM_EXTENSIONS)
+                    or any(word in u for word in STREAM_KEYWORDS)
+                ):
+                    if resp.url not in found:
+                        found.append(resp.url)
+
+            page.on("request", on_request)
+            page.on("response", on_response)
+
+            # -------------------------
+            # LOAD PAGE
+            # -------------------------
+            page.goto(url, timeout=30000, wait_until="networkidle")
+
+            page.wait_for_timeout(4000)
+
+            # -------------------------
+            # HTML CONTENT SCAN
+            # -------------------------
+            html = page.content()
+
+            urls = re.findall(r'https?://[^\s"\'<>]+', html)
+
+            for u in urls:
+                test = u.lower()
 
                 if (
                     any(ext in test for ext in STREAM_EXTENSIONS)
                     or any(word in test for word in STREAM_KEYWORDS)
                 ):
-                    if resp.url not in found:
-                        found.append(resp.url)
+                    if u not in found:
+                        found.append(u)
 
-            page.on("response", on_response)
+            # -------------------------
+            # SCRIPT SCAN
+            # -------------------------
+            scripts = page.locator("script").all()
 
-            page.goto(
-                url,
-                wait_until="networkidle",
-                timeout=30000
-            )
+            for s in scripts:
+                try:
+                    txt = s.inner_text()
+                    urls = re.findall(r'https?://[^\s"\'<>]+', txt)
 
-            page.wait_for_timeout(5000)
+                    for u in urls:
+                        test = u.lower()
+
+                        if (
+                            any(ext in test for ext in STREAM_EXTENSIONS)
+                            or any(word in test for word in STREAM_KEYWORDS)
+                        ):
+                            if u not in found:
+                                found.append(u)
+                except:
+                    pass
+
+            # -------------------------
+            # IFRAMES
+            # -------------------------
+            for frame in page.frames:
+                try:
+                    fhtml = frame.content()
+
+                    urls = re.findall(r'https?://[^\s"\'<>]+', fhtml)
+
+                    for u in urls:
+                        test = u.lower()
+
+                        if (
+                            any(ext in test for ext in STREAM_EXTENSIONS)
+                            or any(word in test for word in STREAM_KEYWORDS)
+                        ):
+                            if u not in found:
+                                found.append(u)
+
+                except:
+                    pass
 
             browser.close()
 
@@ -116,11 +182,10 @@ def detect_playwright(url):
 
 
 # =========================
-# API
+# API ENDPOINT
 # =========================
 @app.route("/find")
 def find():
-
     url = request.args.get("url")
 
     if not url:
@@ -139,7 +204,8 @@ def find():
     if streams:
         return jsonify({
             "stream": streams[0],
-            "source": "playwright"
+            "source": "playwright",
+            "count": len(streams)
         })
 
     return jsonify({
@@ -151,10 +217,5 @@ def find():
 # START
 # =========================
 if __name__ == "__main__":
-
     port = int(os.environ.get("PORT", 5000))
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=port)
