@@ -2,6 +2,7 @@ from flask import Flask, request, Response, jsonify
 import requests
 import re
 import time
+import os
 
 app = Flask(__name__)
 
@@ -9,17 +10,13 @@ app = Flask(__name__)
 # CONFIG
 # =========================
 CACHE = {}
-CACHE_TTL = 90
+CACHE_TTL = 60
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "*/*"
+    "User-Agent": "Mozilla/5.0"
 }
 
-STREAM_EXT = (".m3u8", ".mpd", ".ts", ".m4s", ".mp4", ".mkv")
-KEYWORDS = ("manifest", "playlist", "master", "hls", "dash", "live", "index")
-
-TIMEOUT = 8
+STREAM_EXT = (".m3u8", ".mpd")
 
 
 # =========================
@@ -58,20 +55,10 @@ def cache_set(url, stream):
 # =========================
 def detect_stream(url):
     try:
-        time.sleep(0.2)
-
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        r = requests.get(url, headers=HEADERS, timeout=8)
         html = r.text
 
-        # direct links
-        links = re.findall(r'https?://[^\s"\'<>]+', html)
-
-        for l in links:
-            low = l.lower()
-            if any(x in low for x in STREAM_EXT):
-                return l
-
-        # m3u8 / mpd direct
+        # 1) direct m3u8/mpd
         m3u8 = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
         if m3u8:
             return m3u8[0]
@@ -80,12 +67,18 @@ def detect_stream(url):
         if mpd:
             return mpd[0]
 
-        # iframe fallback
+        # 2) fallback links
+        links = re.findall(r'https?://[^\s"\'<>]+', html)
+        for l in links:
+            if any(ext in l.lower() for ext in STREAM_EXT):
+                return l
+
+        # 3) iframe (1 level only)
         iframes = re.findall(r'src="(http[^"]+)"', html)
 
         for i in iframes:
             try:
-                r2 = requests.get(i, headers=HEADERS, timeout=TIMEOUT)
+                r2 = requests.get(i, headers=HEADERS, timeout=8)
                 h2 = r2.text
 
                 m3 = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', h2)
@@ -108,28 +101,24 @@ def detect_stream(url):
 # =========================
 # RESOLVER
 # =========================
-def resolve_sources(sources, retries=5, delay=2):
-    for i in range(retries):
+def resolve_sources(sources):
+    for url in sources:
 
-        for url in sources:
+        cached = cache_get(url)
+        if cached:
+            return cached
 
-            cached = cache_get(url)
-            if cached:
-                return cached
+        stream = detect_stream(url)
 
-            stream = detect_stream(url)
-
-            if stream:
-                cache_set(url, stream)
-                return stream
-
-        time.sleep(delay + i * 0.5)
+        if stream:
+            cache_set(url, stream)
+            return stream
 
     return None
 
 
 # =========================
-# API
+# PLAY ENDPOINT
 # =========================
 @app.route("/play/<name>")
 def play(name):
@@ -145,6 +134,9 @@ def play(name):
     return jsonify({"stream": stream})
 
 
+# =========================
+# M3U PLAYLIST
+# =========================
 @app.route("/playlist.m3u")
 def playlist():
     base = request.host_url.rstrip("/")
@@ -157,6 +149,15 @@ def playlist():
     return Response(out, mimetype="text/plain")
 
 
+# =========================
 @app.route("/")
 def home():
-    return "STREAM SERVER RUNNING"
+    return "STABLE IPTV SERVER RUNNING"
+
+
+# =========================
+# RENDER / GUNICORN FIX
+# =========================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
