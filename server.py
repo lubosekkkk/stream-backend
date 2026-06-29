@@ -4,15 +4,67 @@ import re
 import requests
 
 app = Flask(__name__)
+STREAM_EXTENSIONS = (
+    ".m3u8",
+    ".mpd",
+    ".ts",
+    ".m4s",
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".f4m",
+    ".ism",
+    ".isml"
+)
+
+STREAM_KEYWORDS = (
+    "manifest",
+    "playlist",
+    "master",
+    "index.mpd",
+    "index.m3u8",
+    "live",
+    "dash",
+    "hls"
+)
 
 def detect_html(url):
     try:
         r = requests.get(url, timeout=10)
         urls = re.findall(r'https?://[^\s"\'<>]+', r.text)
 
-        for u in urls:
-            if ".m3u8" in u:
-                return u
+STREAM_EXTENSIONS = (
+    ".m3u8",
+    ".mpd",
+    ".ts",
+    ".m4s",
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".f4m",
+    ".ism",
+    ".isml"
+)
+
+STREAM_KEYWORDS = (
+    "manifest",
+    "playlist",
+    "master",
+    "index.mpd",
+    "index.m3u8",
+    "live",
+    "dash",
+    "hls"
+)
+
+for u in urls:
+    url = u.lower()
+
+    if (
+        any(ext in url for ext in STREAM_EXTENSIONS)
+        or any(keyword in url for keyword in STREAM_KEYWORDS)
+    ):
+        return u
 
         return None
 
@@ -31,10 +83,14 @@ def detect_playwright(url):
             )
             page = browser.new_page()
 
-            def on_response(resp):
-                try:
-                    if ".m3u8" in resp.url:
-                        found.append(resp.url)
+   def on_response(resp):
+    url = resp.url.lower()
+
+    if (
+        any(ext in url for ext in STREAM_EXTENSIONS)
+        or any(keyword in url for keyword in STREAM_KEYWORDS)
+    ):
+        found.append(resp.url)
                 except:
                     pass
 
