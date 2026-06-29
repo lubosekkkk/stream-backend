@@ -1,107 +1,108 @@
 from flask import Flask, request, jsonify, Response, send_from_directory
-import requests
-import re
-import os
-import uuid
 import threading
-import subprocess
 import time
+import uuid
+import os
+import subprocess
+import requests
+from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
 
 # =========================
-# STORAGE (DYNAMIC CHANNELS)
+# STORAGE
 # =========================
-CHANNELS = {}  # name -> source url
-STREAMS = {}   # stream_id -> ffmpeg process info
+CHANNELS = {}  # name -> [url1, url2, url3]
+STREAM_POOL = {}  # active ffmpeg processes
 CACHE = {}
 
 OUTPUT_DIR = "streams"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-CHECK_INTERVAL = 15
+CHECK_INTERVAL = 10
 
 
 # =========================
-# HEADERS
-# =========================
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
-
-STREAM_HINTS = (".m3u8", ".mpd", ".mp4", ".ts", ".m4s", ".mkv")
-KEYWORDS = ("manifest", "playlist", "dash", "hls", "live")
-
-
-# =========================
-# ADD CHANNEL API (DYNAMIC)
+# ADD CHANNEL (3 SOURCES)
 # =========================
 @app.route("/add")
-def add_channel():
+def add():
     name = request.args.get("name")
-    url = request.args.get("url")
+    urls = request.args.getlist("url")
 
-    if not name or not url:
-        return jsonify({"error": "missing name or url"}), 400
+    if not name or len(urls) == 0:
+        return jsonify({"error": "name + urls required"}), 400
 
-    CHANNELS[name] = url
+    # max 3 fallback sources
+    CHANNELS[name] = urls[:3]
 
-    return jsonify({"ok": True, "channels": len(CHANNELS)})
+    return jsonify({"ok": True, "count": len(CHANNELS)})
 
 
 # =========================
-# SIMPLE STREAM FINDER
+# NETWORK SNIFFER (Playwright)
 # =========================
-def find_stream(url):
+def sniff(url):
+    found = []
+
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        html = r.text
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
 
-        urls = re.findall(r'https?://[^\s"\'<>]+', html)
+            def on_response(resp):
+                u = resp.url.lower()
+                if ".m3u8" in u or ".mpd" in u:
+                    found.append(resp.url)
 
-        for u in urls:
-            t = u.lower()
-            if any(x in t for x in STREAM_HINTS) or any(k in t for k in KEYWORDS):
-                return u
+            page.on("response", on_response)
+            page.goto(url, timeout=20000)
+            page.wait_for_timeout(4000)
+
+            browser.close()
 
     except:
-        return None
+        pass
+
+    return found
+
+
+# =========================
+# RESOLVER (3 SOURCE FALLBACK)
+# =========================
+def resolve(urls):
+    for url in urls:
+
+        # 1) direct sniff
+        streams = sniff(url)
+        if streams:
+            return streams[0]
+
+        # 2) direct m3u8/mpd check
+        try:
+            r = requests.get(url, timeout=8)
+            if ".m3u8" in r.text:
+                return url
+        except:
+            pass
 
     return None
 
 
 # =========================
-# RESOLVE WITH RETRY
-# =========================
-def resolve(url):
-    if url in CACHE:
-        return CACHE[url]
-
-    for _ in range(3):
-        stream = find_stream(url)
-        if stream:
-            CACHE[url] = stream
-            return stream
-        time.sleep(0.5)
-
-    return None
-
-
-# =========================
-# FFMPEG PROXY (HLS OUTPUT)
+# FFMPEG START (PERSISTENT)
 # =========================
 def ffmpeg_worker(stream_id, url):
-    out_dir = os.path.join(OUTPUT_DIR, stream_id)
-    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, stream_id)
+    os.makedirs(out_path, exist_ok=True)
 
-    output = os.path.join(out_dir, "index.m3u8")
+    output = os.path.join(out_path, "index.m3u8")
 
     cmd = [
         "ffmpeg",
         "-re",
         "-i", url,
 
-        # stabilní TV output
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
@@ -118,7 +119,7 @@ def ffmpeg_worker(stream_id, url):
 
     proc = subprocess.Popen(cmd)
 
-    STREAMS[stream_id] = {
+    STREAM_POOL[stream_id] = {
         "proc": proc,
         "url": url,
         "last_ok": time.time()
@@ -126,24 +127,22 @@ def ffmpeg_worker(stream_id, url):
 
 
 # =========================
-# AUTO HEAL WATCHDOG (⚡ KEY FEATURE)
+# WATCHDOG (AUTO HEAL 24/7)
 # =========================
 def watchdog():
     while True:
         time.sleep(CHECK_INTERVAL)
 
-        for sid in list(STREAMS.keys()):
-            info = STREAMS[sid]
+        for sid in list(STREAM_POOL.keys()):
+            info = STREAM_POOL[sid]
             proc = info["proc"]
 
-            # restart když FFmpeg spadne
+            # restart dead ffmpeg
             if proc.poll() is not None:
-                print("RESTART STREAM:", sid)
+                print("RESTART:", sid)
 
-                new_id = sid
-                ffmpeg_worker(new_id, info["url"])
-
-                del STREAMS[sid]
+                ffmpeg_worker(sid, info["url"])
+                del STREAM_POOL[sid]
 
 
 threading.Thread(target=watchdog, daemon=True).start()
@@ -158,12 +157,12 @@ def play(name):
     if name not in CHANNELS:
         return "not found", 404
 
-    source = CHANNELS[name]
+    urls = CHANNELS[name]
 
-    stream = resolve(source)
+    stream = resolve(urls)
 
     if not stream:
-        return "no stream found", 404
+        return jsonify({"error": "no stream found"}), 404
 
     sid = str(uuid.uuid4())
 
@@ -173,16 +172,17 @@ def play(name):
     ).start()
 
     return jsonify({
-        "url": f"/hls/{sid}/index.m3u8"
+        "stream": f"/hls/{sid}/index.m3u8"
     })
 
 
 # =========================
-# M3U PLAYLIST (FOR IPTV APPS)
+# IPTV PLAYLIST (PHONE READY)
 # =========================
 @app.route("/playlist.m3u")
 def playlist():
     base = request.host_url.rstrip("/")
+
     out = "#EXTM3U\n"
 
     for name in CHANNELS:
@@ -193,7 +193,7 @@ def playlist():
 
 
 # =========================
-# SERVE HLS
+# HLS SERVER
 # =========================
 @app.route("/hls/<sid>/<file>")
 def hls(sid, file):
@@ -203,9 +203,8 @@ def hls(sid, file):
 # =========================
 @app.route("/")
 def home():
-    return "DYNAMIC IPTV SERVER + AUTO HEAL RUNNING"
+    return "REAL IPTV ENGINE RUNNING"
 
 
-# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
