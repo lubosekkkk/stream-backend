@@ -1,37 +1,25 @@
-from flask import Flask, request, jsonify, Response, send_from_directory
+from flask import Flask, request, Response, jsonify
 import requests
 import re
 import time
-import threading
-import subprocess
-import uuid
-import os
 
 app = Flask(__name__)
 
 # =========================
 # CONFIG
 # =========================
-OUTPUT_DIR = "streams"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-CACHE = {}          # url -> (stream, timestamp)
-CACHE_TTL = 60
-
-POOL = {}           # ffmpeg processes
-
-CHECK_INTERVAL = 10
+CACHE = {}
+CACHE_TTL = 60  # cache 60s
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
 
-STREAM_EXT = (".m3u8", ".mpd", ".ts", ".m4s", ".mp4")
+STREAM_EXT = (".m3u8", ".mpd")
 KEYWORDS = ("manifest", "playlist", "master", "hls", "dash", "live")
 
-
 # =========================
-# 3-STREAM CHANNELS (fallback engine)
+# CHANNELS (3 SOURCES EACH)
 # =========================
 CHANNELS = {
     "test": [
@@ -43,13 +31,24 @@ CHANNELS = {
 
 
 # =========================
-# REAL STREAM SNIFFER V2 (LIGHT)
+# CACHE
 # =========================
-def sniff_stream(url):
-    """
-    Pomalejší, ale výrazně úspěšnější než rychlé regexy
-    """
+def cache_get(url):
+    if url in CACHE:
+        stream, ts = CACHE[url]
+        if time.time() - ts < CACHE_TTL:
+            return stream
+    return None
 
+
+def cache_set(url, stream):
+    CACHE[url] = (stream, time.time())
+
+
+# =========================
+# STREAM DETECTOR (LIGHT SNIFFER V2)
+# =========================
+def detect_stream(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         html = r.text
@@ -59,10 +58,10 @@ def sniff_stream(url):
 
         for l in links:
             low = l.lower()
-            if any(x in low for x in STREAM_EXT):
+            if any(ext in low for ext in STREAM_EXT):
                 return l
 
-        # 2) iframe recursion (1 level)
+        # 2) iframe follow (1 level)
         iframes = re.findall(r'src="(http[^"]+)"', html)
 
         for i in iframes:
@@ -88,23 +87,22 @@ def sniff_stream(url):
 
 
 # =========================
-# SLOW RETRY RESOLVER (IMPORTANT FIX)
+# SLOW RESOLVER (retry + delay)
 # =========================
-def resolve_with_retry(urls, retries=4, delay=2):
+def resolve_sources(sources, retries=4, delay=2):
+
     for _ in range(retries):
 
-        for u in urls:
+        for url in sources:
 
-            # cache hit
-            if u in CACHE:
-                stream, ts = CACHE[u]
-                if time.time() - ts < CACHE_TTL:
-                    return stream
+            cached = cache_get(url)
+            if cached:
+                return cached
 
-            stream = sniff_stream(u)
+            stream = detect_stream(url)
 
             if stream:
-                CACHE[u] = (stream, time.time())
+                cache_set(url, stream)
                 return stream
 
         time.sleep(delay)
@@ -113,60 +111,7 @@ def resolve_with_retry(urls, retries=4, delay=2):
 
 
 # =========================
-# FFMPEG PIPE (PERSISTENT)
-# =========================
-def ffmpeg_start(stream_id, url):
-    out_dir = os.path.join(OUTPUT_DIR, stream_id)
-    os.makedirs(out_dir, exist_ok=True)
-
-    out = os.path.join(out_dir, "index.m3u8")
-
-    cmd = [
-        "ffmpeg",
-        "-re",
-        "-i", url,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
-        "-c:a", "aac",
-        "-f", "hls",
-        "-hls_time", "4",
-        "-hls_list_size", "6",
-        "-hls_flags", "delete_segments+append_list",
-        out
-    ]
-
-    proc = subprocess.Popen(cmd)
-
-    POOL[stream_id] = {
-        "proc": proc,
-        "url": url,
-        "last_ok": time.time()
-    }
-
-
-# =========================
-# WATCHDOG (AUTO RESTART)
-# =========================
-def watchdog():
-    while True:
-        time.sleep(CHECK_INTERVAL)
-
-        for sid in list(POOL.keys()):
-            proc = POOL[sid]["proc"]
-
-            if proc.poll() is not None:
-                print("[RESTART]", sid)
-
-                ffmpeg_start(sid, POOL[sid]["url"])
-                del POOL[sid]
-
-
-threading.Thread(target=watchdog, daemon=True).start()
-
-
-# =========================
-# PLAY ENDPOINT
+# PLAY ENDPOINT (VLC FRIENDLY)
 # =========================
 @app.route("/play/<name>")
 def play(name):
@@ -174,32 +119,21 @@ def play(name):
     if name not in CHANNELS:
         return "not found", 404
 
-    urls = CHANNELS[name]
+    sources = CHANNELS[name]
 
-    stream = resolve_with_retry(urls)
+    stream = resolve_sources(sources)
 
     if not stream:
         return jsonify({"error": "stream not found"}), 404
 
-    sid = str(uuid.uuid4())
-
-    ffmpeg_start(sid, stream)
-
+    # VLC dostane rovnou stream URL
     return jsonify({
-        "stream": f"/hls/{sid}/index.m3u8"
+        "stream": stream
     })
 
 
 # =========================
-# HLS SERVER
-# =========================
-@app.route("/hls/<sid>/<file>")
-def hls(sid, file):
-    return send_from_directory(os.path.join(OUTPUT_DIR, sid), file)
-
-
-# =========================
-# PLAYLIST (VLC ONLY)
+# M3U PLAYLIST (for VLC)
 # =========================
 @app.route("/playlist.m3u")
 def playlist():
@@ -216,8 +150,4 @@ def playlist():
 # =========================
 @app.route("/")
 def home():
-    return "REAL STREAM SNIFFER V2 RUNNING"
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    return "REAL STREAM SNIFFER V2 (NO FFMPEG) RUNNING"
